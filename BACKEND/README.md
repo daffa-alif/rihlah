@@ -63,7 +63,6 @@ app/
     kyc/               one-shot KYC verification (vision/ocr/validation/service)
 docs/API.md            hand-written API reference
 tests/                 pytest suite over the HTTP surface
-frontend/              Svelte harness for exercising /kyc/verify with a real camera
 ```
 
 ## Notes
@@ -98,10 +97,3 @@ Two honesty constraints worth knowing before relying on this in production:
   (`422`/`503`) instead of guessing.
 
 Requires the Tesseract OCR binary (see Requirements above).
-
-## Frontend test harness
-
-`frontend/` is a small Svelte app for exercising `/kyc/verify` with a real
-device camera. See [frontend/README.md](frontend/README.md) to run it. It
-never writes captured photos to disk/localStorage — frames are captured to
-an in-memory canvas, sent to the backend, and discarded.
