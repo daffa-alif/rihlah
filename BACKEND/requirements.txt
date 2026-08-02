@@ -1,0 +1,14 @@
+fastapi>=0.115
+uvicorn[standard]>=0.32
+pydantic>=2.9
+pydantic-settings>=2.6
+python-dotenv>=1.0
+python-multipart>=0.0.12
+
+# KYC document/biometric processing (in-memory only, see app/services/kyc/)
+numpy>=2.0
+# Pinned: 5.x dropped the bundled Haar cascade data files that face detection
+# relies on (see app/services/kyc/vision.py).
+opencv-python-headless==4.11.0.86
+pillow>=11.0
+pytesseract>=0.3.13

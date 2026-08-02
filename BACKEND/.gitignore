@@ -1,0 +1,51 @@
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Python bytecode / build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+build/
+dist/
+*.egg
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+*.pfx
+*.p12
+secrets.json
+credentials.json
+*serviceAccount*.json
+*service-account*.json
+
+# Databases
+*.sqlite3
+*.sqlite
+*.db
+
+# Test / lint / type-check caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Logs
+*.log
+logs/
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
