@@ -21,8 +21,15 @@ Copy-Item .env.example .env
 
 ## Run
 
+Imports throughout this app are `BACKEND.app.*` (absolute from the repo
+root), so `BACKEND` must be importable — running `uvicorn app.main:app`
+from inside this folder will fail with `ModuleNotFoundError`. From this
+folder (so `.env` is found via its default relative path), point
+`PYTHONPATH` at the repo root instead:
+
 ```powershell
-uvicorn app.main:app --reload
+$env:PYTHONPATH = (Resolve-Path ..).Path
+uvicorn BACKEND.app.main:app --reload
 ```
 
 | Surface | URL |
@@ -77,23 +84,46 @@ tests/                 pytest suite over the HTTP surface
 
 ## KYC verification (`POST /kyc/verify`)
 
-One-shot driver KYC: a live KTP/SIM photo + a live selfie (+ optional STNK
-photo) are decoded in memory, run through face detection/matching, a
-liveness heuristic, and OCR, then discarded — nothing is written to disk or
-persisted. See [docs/API.md](docs/API.md#kyc) for the full payload/response
-shape and business rules (SIM expiry, vehicle age, geofence, etc).
+One-shot driver KYC: a live KTP/SIM photo + an ordered burst of live selfie
+frames (+ optional STNK photo) are decoded in memory, run through face
+detection/matching, frame-by-frame liveness analysis, and OCR, then
+discarded — nothing is written to disk or persisted. Identity is never
+driver-typed: it's read entirely off the document by OCR, then confirmed
+against Dukcapil. See [docs/API.md](docs/API.md#kyc) for the full
+payload/response shape and business rules (SIM expiry, vehicle age,
+geofence, etc).
 
-Two honesty constraints worth knowing before relying on this in production:
+Three honesty constraints worth knowing before relying on this in production:
 
-- **Face match / liveness are classical OpenCV heuristics** (histogram +
-  ORB keypoint correlation; sharpness + frequency-domain analysis), not a
-  deep-learning face embedding or a multi-frame anti-spoofing model. They're
-  fully offline and explainable, but not biometric-grade — swap in a proper
-  face-recognition/liveness SDK before trusting this for real fraud
-  prevention.
-- **OCR field parsing is a best-effort layout reader** for Indonesian
-  KTP/SIM/STNK formats, not a certified Dukcapil/Korlantas integration. If a
-  required field can't be read off the photo, the endpoint fails loudly
-  (`422`/`503`) instead of guessing.
+- **Face match is a classical OpenCV heuristic** (histogram + ORB keypoint
+  correlation), not a deep-learning face embedding model. It's fully
+  offline and explainable, but not biometric-grade — swap in a proper
+  face-recognition SDK before trusting this for real fraud prevention.
+- **Liveness is behavior-based across a frame burst, not a single-frame
+  guess**: it looks for an actual open→closed→open blink, natural
+  face-position drift between frames, and average sharpness (see
+  `analyze_liveness_frames` in
+  [app/services/kyc/vision.py](app/services/kyc/vision.py)). Still classical
+  CV, not a dedicated anti-spoofing model — the client is expected to supply
+  a genuine live burst (e.g. frames extracted from a few seconds of camera
+  video in the Flutter app), not a set of unrelated photos.
+- **Dukcapil confirmation is currently a stub** — this project has no real
+  Dukcapil API credential. `dukcapil.confirm_identity()` in
+  [app/services/kyc/dukcapil.py](app/services/kyc/dukcapil.py) always echoes
+  the OCR-extracted identity back as `MATCHED` (marked `source: "STUB"` in
+  the response) rather than performing a real registry check. Likewise,
+  **OCR field parsing is a best-effort layout reader** for Indonesian
+  KTP/SIM/STNK formats, not a certified Korlantas integration — if a required
+  field can't be read off the photo, the endpoint fails loudly (`422`/`503`)
+  instead of guessing. A synthetic test KTP with OCR-friendly text is at
+  [tests/fixtures/sample_ktp.jpg](tests/fixtures/sample_ktp.jpg) (regenerate
+  via `tests/fixtures/generate_ktp_fixture.py`) for exercising the parser
+  without a real ID.
 
 Requires the Tesseract OCR binary (see Requirements above).
+
+The production client for this endpoint is a Flutter mobile app (captures
+the live selfie burst from the device camera) — not yet in this repo. The
+sibling [`testing/`](../testing) folder is a small Svelte web harness for
+manually exercising `/kyc/verify` against a browser camera in the
+meantime; it is not the product frontend.

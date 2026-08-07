@@ -1,6 +1,6 @@
 # Rihlah API Reference
 
-Version `0.1.0` · Base URL `http://localhost:8000/api/v1`
+Version `0.2.0` · Base URL `http://localhost:8000/api/v1`
 
 Interactive versions of this document are generated from the code and served by
 the app itself:
@@ -84,7 +84,7 @@ Liveness probe. Use for container health checks and uptime monitoring.
 ```json
 {
   "status": "ok",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "environment": "development"
 }
 ```
@@ -199,26 +199,33 @@ Delete a trip.
 
 ## KYC
 
-One-shot driver identity verification. A live-captured KTP or SIM photo, a
-live selfie, and an optional STNK photo are decoded **in memory**, run
-through OCR + face detection/matching + a liveness check, cross-validated
-against the driver's claimed data, and then discarded. **No photo bytes are
-ever written to disk, cached, or persisted anywhere** — the response is the
-only record of the check having happened.
+One-shot driver identity verification. A live-captured KTP or SIM photo, an
+ordered burst of live selfie frames, and an optional STNK photo are decoded
+**in memory**, run through OCR + face detection/matching + frame-by-frame
+liveness, and then discarded. **No photo/frame bytes are ever written to
+disk, cached, or persisted anywhere** — the response is the only record of
+the check having happened.
+
+Identity (NIK/name/date of birth) is **never driver-typed**. It comes
+entirely from OCR on the document photo, then gets confirmed against
+Dukcapil (currently a stub — see "Dukcapil confirmation" below). Only the
+vehicle (when no STNK photo is supplied) and financial data are still
+driver-supplied claims.
 
 See the [README's KYC section](../README.md#kyc-verification-post-kycverify)
-for the honesty constraints on face-match/liveness accuracy and OCR field
-extraction before relying on this for production fraud prevention.
+for the honesty constraints on face-match/liveness accuracy, OCR field
+extraction, and the Dukcapil stub before relying on this for production
+fraud prevention.
 
 ### `POST /kyc/verify`
 
-`multipart/form-data` with four parts:
+`multipart/form-data`:
 
 | Part | Type | Required | Notes |
 | --- | --- | --- | --- |
 | `payload` | text (JSON) | yes | A JSON-encoded `KycVerificationRequest` (see below). |
 | `id_document_photo` | file | yes | Live photo of the KTP or SIM. `image/jpeg`, `image/png` or `image/webp`, ≤ 8MB. |
-| `selfie_photo` | file | yes | Live selfie for face match + liveness. Same type/size limits. |
+| `selfie_frames` | file, repeated | yes | Ordered live-captured selfie frames — a short burst/video extracted client-side (e.g. by the Flutter app) — for frame-by-frame liveness analysis. `KYC_MIN_LIVENESS_FRAMES`–`KYC_MAX_LIVENESS_FRAMES` frames (default 5–40), same type/size limits per frame. Send as repeated `selfie_frames` multipart fields, in capture order. |
 | `stnk_photo` | file | no | Live STNK photo. If omitted, `claimed_vehicle.brand`/`model`/`year` become required in `payload` instead. |
 
 **`payload` shape (`KycVerificationRequest`)**
@@ -226,13 +233,6 @@ extraction before relying on this for production fraud prevention.
 ```json
 {
   "document_type": "KTP",
-  "claimed_identity": {
-    "nik": "3173015505990001",
-    "full_name": "Budi Santoso",
-    "date_of_birth": "1999-05-15",
-    "sim_number": "990412345678",
-    "sim_class": "C"
-  },
   "claimed_vehicle": {
     "plate_number": "B 1234 XYZ",
     "vehicle_type": "MOTOR",
@@ -255,11 +255,11 @@ extraction before relying on this for production fraud prevention.
 ```
 
 `document_type` is `KTP` or `SIM` and selects which OCR parser reads
-`id_document_photo`. `claimed_identity.sim_number` is required when
-`document_type` is `SIM`. `financial` is optional. `device.device_id` is
-client-supplied; `ip_address` and `user_agent` in the response are read
-server-side from the request instead, since a client can't be trusted to
-self-report those honestly.
+`id_document_photo` — there is no separate identity claim, so this is the
+only place the client indicates which document was photographed.
+`financial` is optional. `device.device_id` is client-supplied; `ip_address`
+and `user_agent` in the response are read server-side from the request
+instead, since a client can't be trusted to self-report those honestly.
 
 **Example**
 
@@ -267,7 +267,11 @@ self-report those honestly.
 curl -X POST http://localhost:8000/api/v1/kyc/verify \
   -F "payload=$(cat payload.json)" \
   -F "id_document_photo=@ktp.jpg;type=image/jpeg" \
-  -F "selfie_photo=@selfie.jpg;type=image/jpeg"
+  -F "selfie_frames=@frame01.jpg;type=image/jpeg" \
+  -F "selfie_frames=@frame02.jpg;type=image/jpeg" \
+  -F "selfie_frames=@frame03.jpg;type=image/jpeg" \
+  -F "selfie_frames=@frame04.jpg;type=image/jpeg" \
+  -F "selfie_frames=@frame05.jpg;type=image/jpeg"
 ```
 
 **Response `200` (`KycVerificationResponse`)**
@@ -301,7 +305,7 @@ curl -X POST http://localhost:8000/api/v1/kyc/verify \
   "sim": null,
   "vehicle": {
     "plate_number": "B 1234 XYZ",
-    "owner_name": "Budi Santoso",
+    "owner_name": "BUDI SANTOSO",
     "brand": "Honda",
     "model": "Vario 160",
     "year": 2021,
@@ -316,9 +320,24 @@ curl -X POST http://localhost:8000/api/v1/kyc/verify \
     "selfie_face_detected": true,
     "face_match_score": 0.81,
     "face_match_passed": true,
-    "liveness_confidence_score": 0.73,
-    "liveness_passed": true,
+    "liveness": {
+      "frames_received": 8,
+      "frames_with_face": 8,
+      "blink_detected": true,
+      "motion_score": 0.62,
+      "sharpness_score": 0.74,
+      "liveness_confidence_score": 0.78,
+      "liveness_passed": true
+    },
     "verified_at": "2026-08-01T20:45:00Z"
+  },
+  "dukcapil": {
+    "status": "MATCHED",
+    "nik": "3173015505990001",
+    "full_name": "BUDI SANTOSO",
+    "checked_at": "2026-08-01T20:45:00Z",
+    "source": "STUB",
+    "notes": "No live Dukcapil integration is configured; this echoes the OCR-extracted identity rather than a real registry check."
   },
   "device": {
     "device_id": "device-fingerprint-abc123",
@@ -329,7 +348,7 @@ curl -X POST http://localhost:8000/api/v1/kyc/verify \
   },
   "financial": { "...": "..." },
   "cross_validation": [
-    { "field": "nik", "extracted_value": "3173015505990001", "claimed_value": "3173015505990001", "matched": true }
+    { "field": "nik_structural_date_of_birth", "extracted_value": "1999-05-15", "claimed_value": "1999-05-15", "matched": true }
   ],
   "rejection_reasons": [],
   "processed_at": "2026-08-01T20:45:00Z",
@@ -339,25 +358,44 @@ curl -X POST http://localhost:8000/api/v1/kyc/verify \
 
 `status` is `REJECTED` whenever `rejection_reasons` is non-empty — the
 response body is otherwise identical, so a caller always gets back the full
-extracted/cross-validated data regardless of outcome.
+extracted/confirmed data regardless of outcome. `cross_validation` now only
+holds *internal* document-consistency checks (e.g. the birth date/gender
+encoded in the NIK's own digits vs. what's printed elsewhere on the same
+KTP) — there's no driver-typed claim left to compare against.
+
+### Dukcapil confirmation
+
+`dukcapil` reports whether the OCR-extracted identity was confirmed against
+Dukcapil (Indonesia's civil registry). **This project has no real Dukcapil
+API credential** — see
+[app/services/kyc/dukcapil.py](../app/services/kyc/dukcapil.py). Until a
+real integration is configured (`KYC_DUKCAPIL_BASE_URL`/`KYC_DUKCAPIL_API_KEY`),
+every response has `source: "STUB"` and `status` is either:
+
+| Status | When |
+| --- | --- |
+| `MATCHED` | Always, when a NIK was extracted (`document_type: "KTP"`) — the stub echoes the OCR result rather than performing a real check. |
+| `UNAVAILABLE` | `document_type` was `SIM` — a SIM photo carries no NIK for Dukcapil to check, so confirmation is skipped (not a rejection). |
+| `NOT_FOUND` / `MISMATCH` | Modeled for when a real integration lands; the stub never returns these. |
 
 ### Business rules enforced
 
 | Rule | Detail |
 | --- | --- |
-| NIK format & structure | 16 digits; birth date/gender encoded in digits 7–12 must match the claimed date of birth. |
-| Identity cross-check | Extracted NIK/name/DOB vs claimed — name uses fuzzy match (`KYC_NAME_MATCH_THRESHOLD`), NIK/DOB require exact match. |
+| NIK format & structure | 16 digits; birth date/gender encoded in digits 7–12 must match the birth date/gender printed on the same KTP. |
+| Dukcapil confirmation | Rejected if `dukcapil.status` is `NOT_FOUND` or `MISMATCH` (never happens against the current stub — see above). |
 | Minimum driver age | `KYC_MIN_DRIVER_AGE` (default 17), plus a higher per-SIM-class minimum (e.g. SIM B2 Umum requires 23). |
 | SIM expiry | Rejected if expired or expiring within `KYC_SIM_EXPIRY_WARNING_DAYS` (default 30). |
-| SIM class vs vehicle type | e.g. SIM C only authorizes `MOTOR`, SIM A/B authorizes `MOBIL`. |
+| SIM class vs vehicle type | e.g. SIM C only authorizes `MOTOR`, SIM A/B authorizes `MOBIL`. Requires `document_type: "SIM"` — a KTP alone can't establish SIM class. |
 | Plate number format | Must match the Indonesian plate pattern. |
 | Vehicle age | Rejected if older than `KYC_MAX_VEHICLE_AGE_YEARS` (default 10). |
 | STNK tax validity | Rejected if expired, or unknown (no `stnk_photo` provided). |
 | Bank account holder name | Must exactly match the verified identity name (not fuzzy — financial data needs a stricter bar). |
 | SKCK expiry | Rejected if `skck_valid_until` is in the past. |
 | Geofence | `device.location` must fall inside `KYC_SERVICE_AREA_*` (default: all of Indonesia). |
-| Face match | `face_match_score >= KYC_FACE_MATCH_THRESHOLD` (default 0.55). |
-| Liveness | `liveness_confidence_score >= KYC_LIVENESS_THRESHOLD` (default 0.5). |
+| Face match | `face_match_score >= KYC_FACE_MATCH_THRESHOLD` (default 0.55), matched against the sharpest selfie frame with a detected face. |
+| Liveness | `liveness.liveness_confidence_score >= KYC_LIVENESS_THRESHOLD` (default 0.5) **and** an actual blink detected across the frames, unless `KYC_REQUIRE_BLINK=false`. |
+| Frame count | `selfie_frames` must have between `KYC_MIN_LIVENESS_FRAMES` and `KYC_MAX_LIVENESS_FRAMES` entries (default 5–40). |
 
 A mismatched vehicle owner name (vs. the verified identity) is recorded in
 `cross_validation` but does **not** reject the request — Indonesian
@@ -365,10 +403,10 @@ practice allows driving someone else's vehicle with a power-of-attorney
 letter, which this endpoint has no way to verify.
 
 **Responses** — `200` always (status is `VERIFIED`/`REJECTED` in the body) ·
-`413` if a photo exceeds the size limit · `415` if a photo isn't an accepted
-image type · `422` if the payload fails schema validation, or a required
-field couldn't be extracted from a photo · `503` if the Tesseract OCR engine
-isn't installed.
+`413` if a photo/frame exceeds the size limit · `415` if a photo/frame isn't
+an accepted image type · `422` if the payload fails schema validation, the
+frame count is out of range, or a required field couldn't be extracted from
+a photo · `503` if the Tesseract OCR engine isn't installed.
 
 ---
 
@@ -378,3 +416,4 @@ isn't installed.
 | --- | --- |
 | 0.1.0 | Initial scaffold: health probe and trips CRUD. |
 | 0.1.0 | Added `POST /kyc/verify`: one-shot driver KYC (KTP/SIM + selfie + optional STNK), processed in memory, never persisted. |
+| 0.2.0 | Removed manual `claimed_identity` — identity now comes entirely from OCR, confirmed via a Dukcapil stub (`dukcapil` response field). Replaced single-frame `selfie_photo` with an ordered `selfie_frames` burst for frame-by-frame, behavior-based liveness (blink + motion + sharpness) — see `biometrics.liveness`. |

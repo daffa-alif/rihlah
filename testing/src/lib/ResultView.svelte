@@ -1,4 +1,9 @@
 <script>
+  // Renders one KycVerificationResponse (see BACKEND/app/schemas/kyc.py) —
+  // status, biometrics/liveness, Dukcapil confirmation, OCR'd document
+  // fields, and the internal cross-validation table. Pure display: `result`
+  // is whatever App.svelte got back from submitKycVerification(), nothing
+  // here mutates or persists it.
   let { result } = $props();
 
   let showRaw = $state(false);
@@ -29,9 +34,39 @@
       <div>ID face detected<br /><strong>{result.biometrics.id_face_detected}</strong></div>
       <div>Selfie face detected<br /><strong>{result.biometrics.selfie_face_detected}</strong></div>
       <div>Face match score<br /><strong>{result.biometrics.face_match_score.toFixed(2)}</strong> ({result.biometrics.face_match_passed ? 'pass' : 'fail'})</div>
-      <div>Liveness score<br /><strong>{result.biometrics.liveness_confidence_score.toFixed(2)}</strong> ({result.biometrics.liveness_passed ? 'pass' : 'fail'})</div>
       <div>Verified at<br /><strong>{result.biometrics.verified_at}</strong></div>
     </div>
+  </div>
+
+  <div class="panel">
+    <h3>Liveness (frame-by-frame)</h3>
+    <div class="grid">
+      <div>Frames received<br /><strong>{result.biometrics.liveness.frames_received}</strong></div>
+      <div>Frames with face<br /><strong>{result.biometrics.liveness.frames_with_face}</strong></div>
+      <div>Blink detected<br /><strong>{result.biometrics.liveness.blink_detected}</strong></div>
+      <div>Motion score<br /><strong>{result.biometrics.liveness.motion_score.toFixed(2)}</strong></div>
+      <div>Sharpness score<br /><strong>{result.biometrics.liveness.sharpness_score.toFixed(2)}</strong></div>
+      <div>Liveness confidence<br /><strong>{result.biometrics.liveness.liveness_confidence_score.toFixed(2)}</strong> ({result.biometrics.liveness.liveness_passed ? 'pass' : 'fail'})</div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h3>Dukcapil confirmation</h3>
+    <p class="hint">
+      {#if result.dukcapil.source === 'STUB'}
+        Stub response — no live Dukcapil integration is configured (see backend README).
+      {/if}
+    </p>
+    <div class="grid">
+      <div>Status<br /><strong>{result.dukcapil.status}</strong></div>
+      <div>NIK<br /><strong>{result.dukcapil.nik ?? '—'}</strong></div>
+      <div>Full name<br /><strong>{result.dukcapil.full_name ?? '—'}</strong></div>
+      <div>Checked at<br /><strong>{result.dukcapil.checked_at}</strong></div>
+      <div>Source<br /><strong>{result.dukcapil.source}</strong></div>
+    </div>
+    {#if result.dukcapil.notes}
+      <p class="hint">{result.dukcapil.notes}</p>
+    {/if}
   </div>
 
   {#if result.ktp}

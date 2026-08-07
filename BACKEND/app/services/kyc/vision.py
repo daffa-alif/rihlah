@@ -5,13 +5,16 @@ one request. Nothing is written to disk, cached, or logged. Callers are
 responsible for letting the raw bytes go out of scope once processing is
 done — there is no persistence path in this module to opt out of.
 
-Face matching and liveness use classical OpenCV signals (histogram + ORB
-keypoint correlation, sharpness/frequency analysis), not a deep-learning face
-embedding model — the project has no GPU/vendor dependency to lean on for
-that. That makes both scores explainable and fully offline, but not
-biometric-grade; treat the thresholds in Settings as a starting point and
-swap in a proper face-recognition/liveness SDK before relying on this for
-production-grade fraud prevention.
+Face matching uses classical OpenCV signals (histogram + ORB keypoint
+correlation), not a deep-learning face embedding model — the project has no
+GPU/vendor dependency to lean on for that. Liveness (see
+analyze_liveness_frames) is behavior-based across a burst of frames — blink
+detection + natural face-position drift + average sharpness — rather than a
+single-frame heuristic, since a lone photo can trivially fake one still
+frame but not a genuine blink across many. Both are explainable and fully
+offline, but not biometric-grade; treat the thresholds in Settings as a
+starting point and swap in a proper face-recognition/liveness SDK before
+relying on this for production-grade fraud prevention.
 """
 
 import cv2
@@ -29,6 +32,7 @@ FaceBox = tuple[int, int, int, int]
 _FACE_CASCADE = cv2.CascadeClassifier(
     cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
 )
+_EYE_CASCADE = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_eye.xml")
 
 
 def decode_image(raw: bytes, *, field_name: str, content_type: str | None) -> np.ndarray:
@@ -99,31 +103,151 @@ def face_match_score(face_a: np.ndarray, face_b: np.ndarray) -> float:
     return round(0.5 * hist_score + 0.5 * orb_score, 4)
 
 
-def liveness_score(image: np.ndarray, face_box: FaceBox) -> float:
-    """Single-frame anti-spoofing proxy in [0, 1].
+def _frame_sharpness_score(gray_face: np.ndarray) -> float:
+    """Single-face-crop sharpness proxy in [0, 1] (higher = crisper).
 
-    Combines image sharpness (a printed/re-photographed face tends to be
-    softer than a live capture) with a high-frequency energy penalty (screen
-    replays commonly show moire/pixel-grid artifacts). This is a heuristic
-    stand-in for real liveness detection, which normally needs multiple
-    frames (blink/head-turn challenge) or a dedicated anti-spoofing model.
+    A printed/re-photographed or screen-replayed face tends to be softer
+    than a live capture — this alone isn't liveness proof (see
+    analyze_liveness_frames for the behavior signals that matter more), but
+    it's one contributing signal, averaged across frames.
     """
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    x, y, w, h = face_box
-    face = gray[y : y + h, x : x + w]
+    sharpness = cv2.Laplacian(gray_face, cv2.CV_64F).var()
+    return min(1.0, sharpness / 150.0)
 
-    sharpness = cv2.Laplacian(face, cv2.CV_64F).var()
-    sharpness_score = min(1.0, sharpness / 150.0)
 
-    spectrum = np.fft.fftshift(np.fft.fft2(face))
-    magnitude = np.log(np.abs(spectrum) + 1)
-    fh, fw = magnitude.shape
-    cy, cx = fh // 2, fw // 2
-    half = 5
-    high_freq_energy = float(
-        magnitude[cy - half : cy + half, cx - half : cx + half].mean()
+def _count_eyes(gray_face: np.ndarray) -> int:
+    """Number of eyes detected inside a face crop (0, 1, or 2+)."""
+    eyes = _EYE_CASCADE.detectMultiScale(
+        gray_face, scaleFactor=1.1, minNeighbors=8, minSize=(15, 15)
     )
-    moire_penalty = max(0.0, min(1.0, (high_freq_energy - 8) / 4))
+    return len(eyes)
 
-    score = max(0.0, min(1.0, sharpness_score * (1 - 0.5 * moire_penalty)))
-    return round(score, 4)
+
+class LivenessFrameAnalysis:
+    """Result of analyze_liveness_frames — plain data, not a pydantic model
+    (vision.py stays schema-agnostic; app/services/kyc/service.py maps this
+    onto LivenessBehaviorResult, same pattern as ocr.py's parse_* -> dict)."""
+
+    __slots__ = (
+        "frames_received",
+        "frames_with_face",
+        "blink_detected",
+        "motion_score",
+        "sharpness_score",
+        "liveness_confidence_score",
+        "best_face_crop",
+    )
+
+    def __init__(
+        self,
+        *,
+        frames_received: int,
+        frames_with_face: int,
+        blink_detected: bool,
+        motion_score: float,
+        sharpness_score: float,
+        liveness_confidence_score: float,
+        best_face_crop: np.ndarray | None,
+    ) -> None:
+        self.frames_received = frames_received
+        self.frames_with_face = frames_with_face
+        self.blink_detected = blink_detected
+        self.motion_score = motion_score
+        self.sharpness_score = sharpness_score
+        self.liveness_confidence_score = liveness_confidence_score
+        self.best_face_crop = best_face_crop
+
+
+def analyze_liveness_frames(frames: list[np.ndarray]) -> LivenessFrameAnalysis:
+    """Behavior-based liveness across an ordered burst of live-captured
+    selfie frames (client-extracted from a couple of seconds of video —
+    see app/services/kyc/service.py for how many frames are required).
+
+    Looks for signals a single static photo or a screen replay can't
+    reliably produce:
+
+    - **Blink**: an eyes-detected -> eyes-not-detected -> eyes-detected
+      transition across consecutive frames with a face. A held-up photo
+      shows the same (open or closed) eye state in every frame.
+    - **Motion**: the detected face position naturally drifts a little
+      frame to frame from hand/head micro-movement; a perfectly static box
+      across every single frame is itself a little suspicious.
+    - **Sharpness**: same single-frame proxy as before (see
+      _frame_sharpness_score), averaged over the frames with a face.
+
+    Still classical OpenCV heuristics, not a dedicated anti-spoofing model
+    — see the module docstring. `liveness_confidence_score` blends the
+    three; app/services/kyc/service.py additionally requires an actual
+    detected blink before it will call liveness "passed" (see
+    settings.kyc_require_blink), since the blend alone can be fooled by a
+    lucky combination of motion+sharpness without any real blink.
+    """
+    frames_received = len(frames)
+    eye_open_sequence: list[bool] = []
+    centers: list[tuple[float, float]] = []
+    sharpness_scores: list[float] = []
+    best_face_crop: np.ndarray | None = None
+    best_sharpness = -1.0
+
+    for frame in frames:
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        gray = cv2.equalizeHist(gray)
+        faces = _FACE_CASCADE.detectMultiScale(
+            gray, scaleFactor=1.1, minNeighbors=5, minSize=(60, 60)
+        )
+        if len(faces) == 0:
+            continue
+
+        x, y, w, h = max(faces, key=lambda f: f[2] * f[3])
+        face_crop = gray[y : y + h, x : x + w]
+
+        centers.append((x + w / 2, y + h / 2))
+        eye_open_sequence.append(_count_eyes(face_crop) >= 2)
+
+        sharpness = _frame_sharpness_score(face_crop)
+        sharpness_scores.append(sharpness)
+        if sharpness > best_sharpness:
+            best_sharpness = sharpness
+            best_face_crop = face_crop
+
+    frames_with_face = len(centers)
+
+    blink_detected = False
+    for i in range(1, len(eye_open_sequence) - 1):
+        was_open = eye_open_sequence[i - 1]
+        is_closed = not eye_open_sequence[i]
+        reopened = eye_open_sequence[i + 1]
+        if was_open and is_closed and reopened:
+            blink_detected = True
+            break
+
+    motion_score = 0.0
+    if len(centers) >= 2:
+        xs = [c[0] for c in centers]
+        ys = [c[1] for c in centers]
+        spread = (float(np.std(xs)) ** 2 + float(np.std(ys)) ** 2) ** 0.5
+        # A few pixels of natural drift is expected; scale so ~15px+ of
+        # combined drift reads as fully "in motion" (heuristic constant,
+        # tune against real capture data before relying on this in prod).
+        motion_score = max(0.0, min(1.0, spread / 15.0))
+
+    sharpness_score = 0.0
+    if sharpness_scores:
+        sharpness_score = round(sum(sharpness_scores) / len(sharpness_scores), 4)
+
+    liveness_confidence_score = round(
+        0.45 * (1.0 if blink_detected else 0.0)
+        + 0.30 * motion_score
+        + 0.25 * sharpness_score,
+        4,
+    )
+
+    return LivenessFrameAnalysis(
+        frames_received=frames_received,
+        frames_with_face=frames_with_face,
+        blink_detected=blink_detected,
+        motion_score=round(motion_score, 4),
+        sharpness_score=sharpness_score,
+        liveness_confidence_score=liveness_confidence_score,
+        best_face_crop=best_face_crop,
+    )

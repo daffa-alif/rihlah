@@ -9,7 +9,7 @@ returns — as explicit and cross-checkable as possible.
 from datetime import date, datetime
 from enum import StrEnum
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, field_validator
 
 
 class DocumentType(StrEnum):
@@ -175,16 +175,14 @@ class VehicleData(BaseModel):
 
 
 # --- What the driver claims up front, before OCR runs ----------------------
-
-
-class DriverClaimedIdentity(BaseModel):
-    """Manually entered identity claims, cross-checked against OCR output."""
-
-    nik: str = Field(pattern=r"^\d{16}$")
-    full_name: str = Field(min_length=1, max_length=100)
-    date_of_birth: date
-    sim_number: str | None = Field(default=None, max_length=20)
-    sim_class: SimClass | None = None
+#
+# Identity (NIK/name/date of birth) is deliberately *not* claimed here
+# anymore — it comes entirely from OCR on the document photo plus the
+# Dukcapil confirmation (see app/services/kyc/dukcapil.py), so there is
+# nothing for the driver to type and nothing for a bad actor to fake by
+# typing something that doesn't match their photo. Only the vehicle (which
+# OCR can't always fully cover, e.g. no STNK photo) and financial data are
+# still driver-supplied.
 
 
 class DriverClaimedVehicle(BaseModel):
@@ -233,24 +231,80 @@ class KycVerificationRequest(BaseModel):
     in the `payload` form field, alongside the photo uploads)."""
 
     document_type: DocumentType
-    claimed_identity: DriverClaimedIdentity
     claimed_vehicle: DriverClaimedVehicle
     financial: FinancialData | None = None
     device: DeviceMetadataInput
 
-    @model_validator(mode="after")
-    def check_sim_claim_present_for_sim_flow(self) -> "KycVerificationRequest":
-        if (
-            self.document_type == DocumentType.SIM
-            and not self.claimed_identity.sim_number
-        ):
-            raise ValueError(
-                "claimed_identity.sim_number is required when document_type is SIM"
-            )
-        return self
+
+# --- Dukcapil (civil registry) identity confirmation ------------------------
+
+
+class DukcapilStatus(StrEnum):
+    """Result of checking the OCR'd identity against Dukcapil.
+
+    STUB responses can only ever be MATCHED or UNAVAILABLE — see
+    app/services/kyc/dukcapil.py for why. MISMATCH/NOT_FOUND are modeled now
+    so the response shape doesn't need to change once a real integration
+    replaces the stub.
+    """
+
+    MATCHED = "MATCHED"
+    NOT_FOUND = "NOT_FOUND"
+    MISMATCH = "MISMATCH"
+    UNAVAILABLE = "UNAVAILABLE"
+
+
+class DukcapilConfirmationResult(BaseModel):
+    """Outcome of confirming the OCR-extracted identity against Dukcapil.
+
+    Nothing here is driver-claimed: `nik`/`full_name` are exactly what OCR
+    read off the KTP, sent for confirmation rather than compared against a
+    manual entry.
+    """
+
+    status: DukcapilStatus
+    nik: str | None
+    full_name: str | None
+    checked_at: datetime
+    source: str = Field(
+        default="STUB",
+        description=(
+            "'STUB' means no real Dukcapil API call was made (see "
+            "app/services/kyc/dukcapil.py); a real integration would set "
+            "this to something like 'DUKCAPIL_API'."
+        ),
+    )
+    notes: str | None = None
 
 
 # --- Proof that biometric processing happened, without keeping the photos --
+
+
+class LivenessBehaviorResult(BaseModel):
+    """Multi-frame, behavior-based liveness signal (see
+    app/services/kyc/vision.py's analyze_liveness_frames).
+
+    Derived from an ordered burst of live-captured selfie frames (e.g.
+    extracted client-side from a couple of seconds of video), not a single
+    photo — a static photo or screen replay can't produce a genuine blink or
+    natural head/face movement across frames.
+    """
+
+    frames_received: int = Field(description="Frames submitted in this request.")
+    frames_with_face: int = Field(description="Of those, frames with a detected face.")
+    blink_detected: bool = Field(
+        description="An open->closed->open eye-state transition was observed."
+    )
+    motion_score: float = Field(
+        ge=0, le=1, description="Normalized natural face movement across frames."
+    )
+    sharpness_score: float = Field(
+        ge=0, le=1, description="Average single-frame sharpness proxy (see vision.py)."
+    )
+    liveness_confidence_score: float = Field(
+        ge=0, le=1, description="Blend of blink/motion/sharpness signals."
+    )
+    liveness_passed: bool
 
 
 class BiometricResult(BaseModel):
@@ -258,13 +312,15 @@ class BiometricResult(BaseModel):
     selfie_face_detected: bool
     face_match_score: float = Field(ge=0, le=1)
     face_match_passed: bool
-    liveness_confidence_score: float = Field(ge=0, le=1)
-    liveness_passed: bool
+    liveness: LivenessBehaviorResult
     verified_at: datetime = Field(examples=["2026-08-01T20:45:00Z"])
 
 
 class CrossValidationCheck(BaseModel):
-    """One field-level comparison between OCR-extracted and driver-claimed data."""
+    """One field-level internal-consistency check — e.g. the birth date
+    encoded in the NIK's own digits vs. the birth date printed elsewhere on
+    the same KTP. Nothing here compares against a driver-typed claim
+    anymore; both sides come from the document/registry."""
 
     field: str
     extracted_value: str | None
@@ -282,6 +338,7 @@ class KycVerificationResponse(BaseModel):
     sim: SimExtractedData | None = None
     vehicle: VehicleData
     biometrics: BiometricResult
+    dukcapil: DukcapilConfirmationResult
     device: DeviceMetadataResult
     financial: FinancialData | None = None
     cross_validation: list[CrossValidationCheck]

@@ -9,16 +9,18 @@ export class ApiError extends Error {
 }
 
 /**
- * Submits one KYC verification attempt. The photo Blobs passed in are only
- * ever read here to build the multipart body — this function does not
+ * Submits one KYC verification attempt. The photo/frame Blobs passed in are
+ * only ever read here to build the multipart body — this function does not
  * write them anywhere (no localStorage/IndexedDB/disk), and the caller is
  * expected to drop its own references right after this resolves.
  */
-export async function submitKycVerification(payload, { idDocumentPhoto, selfiePhoto, stnkPhoto }) {
+export async function submitKycVerification(payload, { idDocumentPhoto, selfieFrames, stnkPhoto }) {
   const form = new FormData();
   form.append('payload', JSON.stringify(payload));
   form.append('id_document_photo', idDocumentPhoto, 'id_document.jpg');
-  form.append('selfie_photo', selfiePhoto, 'selfie.jpg');
+  selfieFrames.forEach((frame, i) => {
+    form.append('selfie_frames', frame, `selfie_frame_${String(i).padStart(2, '0')}.jpg`);
+  });
   if (stnkPhoto) {
     form.append('stnk_photo', stnkPhoto, 'stnk.jpg');
   }

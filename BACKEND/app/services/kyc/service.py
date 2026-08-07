@@ -1,12 +1,17 @@
 """KYC verification orchestrator.
 
-Ties together vision (face detect/match/liveness), ocr (document text
-extraction) and validation (business rules) into a single, one-shot check.
+Ties together vision (face detect/match/frame-by-frame liveness), ocr
+(document text extraction) and dukcapil (identity confirmation) into a
+single, one-shot check. Identity (NIK/name/date of birth) is never
+driver-typed: it comes entirely from OCR on the KTP/SIM photo, and is then
+confirmed against Dukcapil (currently a stub — see
+app/services/kyc/dukcapil.py). Only the vehicle (when no STNK photo is
+provided) and financial data are still driver-supplied claims.
 
-Nothing is persisted anywhere in this module: uploaded photo bytes are read
-into local variables, decoded to in-memory arrays, used for detection/OCR,
-and then simply go out of scope when `verify()` returns — there is no
-database, cache or filesystem write in this path.
+Nothing is persisted anywhere in this module: uploaded photo/frame bytes
+are read into local variables, decoded to in-memory arrays, used for
+detection/OCR, and then simply go out of scope when `verify()` returns —
+there is no database, cache or filesystem write in this path.
 """
 
 import uuid
@@ -20,18 +25,20 @@ from BACKEND.app.schemas.kyc import (
     DataSource,
     DeviceMetadataResult,
     DocumentType,
+    DukcapilConfirmationResult,
+    DukcapilStatus,
     FinancialData,
     KtpExtractedData,
     KycStatus,
     KycVerificationRequest,
     KycVerificationResponse,
+    LivenessBehaviorResult,
     SimClass,
     SimExtractedData,
     VehicleData,
     VehicleType,
 )
-from BACKEND.app.services.kyc import ocr, validation
-from BACKEND.app.services.kyc import vision
+from BACKEND.app.services.kyc import dukcapil, ocr, validation, vision
 
 
 class UploadedPhoto:
@@ -50,12 +57,11 @@ class KycService:
         *,
         request: KycVerificationRequest,
         id_document_photo: UploadedPhoto,
-        selfie_photo: UploadedPhoto,
+        selfie_frames: list[UploadedPhoto],
         stnk_photo: UploadedPhoto | None,
         client_ip: str,
         user_agent: str,
     ) -> KycVerificationResponse:
-        claimed = request.claimed_identity
         claimed_vehicle = request.claimed_vehicle
 
         if stnk_photo is None and (
@@ -68,16 +74,28 @@ class KycService:
                 "so vehicle eligibility can be checked."
             )
 
+        if len(selfie_frames) < settings.kyc_min_liveness_frames:
+            raise UnprocessableEntityError(
+                f"At least {settings.kyc_min_liveness_frames} selfie_frames are "
+                f"required for liveness analysis, got {len(selfie_frames)}."
+            )
+        if len(selfie_frames) > settings.kyc_max_liveness_frames:
+            raise UnprocessableEntityError(
+                f"At most {settings.kyc_max_liveness_frames} selfie_frames are "
+                f"accepted per request, got {len(selfie_frames)}."
+            )
+
         id_image = vision.decode_image(
             id_document_photo.raw,
             field_name="id_document_photo",
             content_type=id_document_photo.content_type,
         )
-        selfie_image = vision.decode_image(
-            selfie_photo.raw,
-            field_name="selfie_photo",
-            content_type=selfie_photo.content_type,
-        )
+        selfie_images = [
+            vision.decode_image(
+                frame.raw, field_name="selfie_frames", content_type=frame.content_type
+            )
+            for frame in selfie_frames
+        ]
         stnk_image = None
         if stnk_photo is not None:
             stnk_image = vision.decode_image(
@@ -87,27 +105,36 @@ class KycService:
             )
 
         id_face_box, id_face_crop = vision.detect_largest_face(id_image)
-        selfie_face_box, selfie_face_crop = vision.detect_largest_face(selfie_image)
         id_face_detected = id_face_crop is not None
-        selfie_face_detected = selfie_face_crop is not None
+
+        liveness = vision.analyze_liveness_frames(selfie_images)
+        selfie_face_detected = liveness.frames_with_face > 0
 
         face_match = (
-            vision.face_match_score(id_face_crop, selfie_face_crop)
+            vision.face_match_score(id_face_crop, liveness.best_face_crop)
             if id_face_detected and selfie_face_detected
             else 0.0
         )
-        liveness = (
-            vision.liveness_score(selfie_image, selfie_face_box)
-            if selfie_face_detected
-            else 0.0
+        liveness_passed = (
+            liveness.liveness_confidence_score >= settings.kyc_liveness_threshold
         )
+        if settings.kyc_require_blink:
+            liveness_passed = liveness_passed and liveness.blink_detected
+
         biometrics = BiometricResult(
             id_face_detected=id_face_detected,
             selfie_face_detected=selfie_face_detected,
             face_match_score=face_match,
             face_match_passed=face_match >= settings.kyc_face_match_threshold,
-            liveness_confidence_score=liveness,
-            liveness_passed=liveness >= settings.kyc_liveness_threshold,
+            liveness=LivenessBehaviorResult(
+                frames_received=liveness.frames_received,
+                frames_with_face=liveness.frames_with_face,
+                blink_detected=liveness.blink_detected,
+                motion_score=liveness.motion_score,
+                sharpness_score=liveness.sharpness_score,
+                liveness_confidence_score=liveness.liveness_confidence_score,
+                liveness_passed=liveness_passed,
+            ),
             verified_at=datetime.now(UTC),
         )
 
@@ -129,7 +156,7 @@ class KycService:
         else:
             vehicle = VehicleData(
                 plate_number=claimed_vehicle.plate_number,
-                owner_name=claimed.full_name,
+                owner_name=(ktp.full_name if ktp else sim.full_name),
                 brand=claimed_vehicle.brand,
                 model=claimed_vehicle.model,
                 year=claimed_vehicle.year,
@@ -140,25 +167,21 @@ class KycService:
 
         extracted_full_name = ktp.full_name if ktp else sim.full_name
         extracted_dob = ktp.date_of_birth if ktp else sim.date_of_birth
+        extracted_nik = ktp.nik if ktp else None
         extracted_gender = ktp.gender.value if ktp and ktp.gender else None
 
-        cross_validation, identity_reasons = _check_identity(
-            claimed_nik=claimed.nik,
-            extracted_nik=ktp.nik if ktp else None,
-            claimed_name=claimed.full_name,
-            extracted_name=extracted_full_name,
-            claimed_dob=claimed.date_of_birth,
+        cross_validation, identity_reasons = _check_nik_self_consistency(
+            nik=extracted_nik,
             extracted_dob=extracted_dob,
             extracted_gender=extracted_gender,
         )
 
-        sim_class, sim_reasons = _check_sim(
-            document_type=request.document_type,
-            sim=sim,
-            claimed_sim_number=claimed.sim_number,
-            claimed_sim_class=claimed.sim_class,
-            cross_validation=cross_validation,
+        dukcapil_result = dukcapil.confirm_identity(
+            nik=extracted_nik, full_name=extracted_full_name, date_of_birth=extracted_dob
         )
+        dukcapil_reasons = _check_dukcapil(dukcapil_result)
+
+        sim_class, sim_reasons = _check_sim(document_type=request.document_type, sim=sim)
 
         vehicle_reasons = _check_vehicle(
             vehicle=vehicle,
@@ -192,6 +215,7 @@ class KycService:
 
         rejection_reasons = [
             *identity_reasons,
+            *dukcapil_reasons,
             *sim_reasons,
             *vehicle_reasons,
             *age_reasons,
@@ -216,6 +240,7 @@ class KycService:
             sim=sim,
             vehicle=vehicle,
             biometrics=biometrics,
+            dukcapil=dukcapil_result,
             device=device,
             financial=request.financial,
             cross_validation=cross_validation,
@@ -239,128 +264,77 @@ def _add_check(
     )
 
 
-def _check_identity(
+def _check_nik_self_consistency(
     *,
-    claimed_nik: str,
-    extracted_nik: str | None,
-    claimed_name: str,
-    extracted_name: str,
-    claimed_dob: date,
+    nik: str | None,
     extracted_dob: date,
     extracted_gender: str | None,
 ) -> tuple[list[CrossValidationCheck], list[str]]:
+    """The only identity cross-check left: does the birth date/gender
+    *encoded in the NIK's own digits* match the birth date/gender printed
+    elsewhere on the same KTP? Both sides come from the document itself —
+    there is no driver-typed claim to compare against anymore."""
     checks: list[CrossValidationCheck] = []
     reasons: list[str] = []
 
-    if extracted_nik is not None:
-        nik_matched = extracted_nik == claimed_nik
-        _add_check(
-            checks,
-            field="nik",
-            extracted=extracted_nik,
-            claimed=claimed_nik,
-            matched=nik_matched,
+    if nik is None:
+        return checks, reasons
+
+    nik_dob, nik_gender = validation.parse_nik(nik)
+    if nik_dob is None:
+        reasons.append(
+            "NIK is not well-formed (must be 16 digits with a valid encoded date)."
         )
-        if not nik_matched:
-            reasons.append("NIK on the KTP does not match the claimed NIK.")
+        return checks, reasons
 
-    name_matched = validation.names_match(extracted_name, claimed_name)
+    dob_matched = nik_dob == extracted_dob
     _add_check(
         checks,
-        field="full_name",
-        extracted=extracted_name,
-        claimed=claimed_name,
-        matched=name_matched,
-    )
-    if not name_matched:
-        reasons.append("Extracted full name does not match the claimed full name.")
-
-    dob_matched = extracted_dob == claimed_dob
-    _add_check(
-        checks,
-        field="date_of_birth",
+        field="nik_structural_date_of_birth",
         extracted=extracted_dob.isoformat(),
-        claimed=claimed_dob.isoformat(),
+        claimed=nik_dob.isoformat(),
         matched=dob_matched,
     )
     if not dob_matched:
         reasons.append(
-            "Extracted date of birth does not match the claimed date of birth."
+            "Date of birth encoded in the NIK does not match the date of "
+            "birth printed on the KTP."
         )
 
-    nik_dob, nik_gender = validation.parse_nik(claimed_nik)
-    if nik_dob is not None:
-        nik_dob_matched = nik_dob == claimed_dob
+    if extracted_gender is not None:
+        gender_matched = nik_gender == extracted_gender
         _add_check(
             checks,
-            field="nik_structural_date_of_birth",
-            extracted=nik_dob.isoformat(),
-            claimed=claimed_dob.isoformat(),
-            matched=nik_dob_matched,
+            field="nik_structural_gender",
+            extracted=extracted_gender,
+            claimed=nik_gender,
+            matched=gender_matched,
         )
-        if not nik_dob_matched:
+        if not gender_matched:
             reasons.append(
-                "Date of birth encoded in the NIK does not match the claimed "
-                "date of birth."
+                "Gender encoded in the NIK does not match the gender "
+                "printed on the KTP."
             )
-
-        if extracted_gender is not None:
-            nik_gender_matched = nik_gender == extracted_gender
-            _add_check(
-                checks,
-                field="nik_structural_gender",
-                extracted=extracted_gender,
-                claimed=nik_gender,
-                matched=nik_gender_matched,
-            )
-            if not nik_gender_matched:
-                reasons.append(
-                    "Gender encoded in the NIK does not match the gender "
-                    "read from the KTP."
-                )
 
     return checks, reasons
 
 
+def _check_dukcapil(result: DukcapilConfirmationResult) -> list[str]:
+    if result.status == DukcapilStatus.MATCHED:
+        return []
+    if result.status == DukcapilStatus.UNAVAILABLE:
+        # Not a rejection: e.g. document_type was SIM, which carries no NIK
+        # for Dukcapil to check. See dukcapil.py.
+        return []
+    return [f"Dukcapil could not confirm this identity ({result.status.value})."]
+
+
 def _check_sim(
-    *,
-    document_type: DocumentType,
-    sim: SimExtractedData | None,
-    claimed_sim_number: str | None,
-    claimed_sim_class: SimClass | None,
-    cross_validation: list[CrossValidationCheck],
+    *, document_type: DocumentType, sim: SimExtractedData | None
 ) -> tuple[SimClass | None, list[str]]:
     reasons: list[str] = []
 
     if document_type == DocumentType.SIM and sim is not None:
-        number_matched = (
-            claimed_sim_number is not None and sim.sim_number == claimed_sim_number
-        )
-        _add_check(
-            cross_validation,
-            field="sim_number",
-            extracted=sim.sim_number,
-            claimed=claimed_sim_number,
-            matched=number_matched,
-        )
-        if not number_matched:
-            reasons.append(
-                "SIM number on the card does not match the claimed SIM number."
-            )
-
-        class_matched = (
-            claimed_sim_class is not None and sim.sim_class == claimed_sim_class
-        )
-        _add_check(
-            cross_validation,
-            field="sim_class",
-            extracted=sim.sim_class.value,
-            claimed=claimed_sim_class.value if claimed_sim_class else None,
-            matched=class_matched,
-        )
-        if not class_matched:
-            reasons.append("SIM class on the card does not match the claimed SIM class.")
-
         acceptable, days_remaining = validation.sim_expiry_status(sim.valid_until)
         if not acceptable:
             if days_remaining < 0:
@@ -370,14 +344,14 @@ def _check_sim(
                     f"SIM expires in {days_remaining} day(s), below the "
                     f"{settings.kyc_sim_expiry_warning_days}-day renewal window."
                 )
-
         return sim.sim_class, reasons
 
-    if claimed_sim_class is None:
-        reasons.append("SIM class is required to validate vehicle eligibility.")
-        return None, reasons
-
-    return claimed_sim_class, reasons
+    reasons.append(
+        "SIM class could not be determined from the submitted photos; submit "
+        "your SIM (not just your KTP) as the identity document to verify "
+        "vehicle eligibility."
+    )
+    return None, reasons
 
 
 def _check_vehicle(
@@ -494,7 +468,7 @@ def _check_biometrics(biometrics: BiometricResult) -> list[str]:
     if not biometrics.id_face_detected:
         reasons.append("No face could be detected on the identity document photo.")
     if not biometrics.selfie_face_detected:
-        reasons.append("No face could be detected in the live selfie photo.")
+        reasons.append("No face could be detected in the live selfie frames.")
     if (
         biometrics.id_face_detected
         and biometrics.selfie_face_detected
@@ -504,11 +478,17 @@ def _check_biometrics(biometrics: BiometricResult) -> list[str]:
             f"Face match score {biometrics.face_match_score:.2f} is below the "
             f"{settings.kyc_face_match_threshold:.2f} threshold."
         )
-    if biometrics.selfie_face_detected and not biometrics.liveness_passed:
-        reasons.append(
-            f"Liveness confidence {biometrics.liveness_confidence_score:.2f} "
-            f"is below the {settings.kyc_liveness_threshold:.2f} threshold."
-        )
+    if biometrics.selfie_face_detected and not biometrics.liveness.liveness_passed:
+        if settings.kyc_require_blink and not biometrics.liveness.blink_detected:
+            reasons.append(
+                "No blink was detected across the submitted selfie frames."
+            )
+        else:
+            score = biometrics.liveness.liveness_confidence_score
+            reasons.append(
+                f"Liveness confidence {score:.2f} is below the "
+                f"{settings.kyc_liveness_threshold:.2f} threshold."
+            )
     return reasons
 
 

@@ -1,21 +1,20 @@
 <script>
+  // Top-level page for the KYC test harness: owns the form state, builds the
+  // `KycVerificationRequest` JSON payload, and wires the camera components'
+  // captured Blobs into one POST /kyc/verify submission. See lib/api.js for
+  // the actual request, and README.md's "Layout" section for how the pieces
+  // fit together.
   import CameraCapture from './lib/CameraCapture.svelte';
+  import BurstCapture from './lib/BurstCapture.svelte';
   import ResultView from './lib/ResultView.svelte';
   import { submitKycVerification } from './lib/api.js';
   import { getDeviceId } from './lib/deviceId.js';
   import { getCurrentLocation } from './lib/geolocation.js';
 
-  const SIM_CLASSES = ['A', 'A_UMUM', 'B1', 'B1_UMUM', 'B2', 'B2_UMUM', 'C', 'C1', 'C2', 'D', 'D1'];
+  // Must stay >= the backend's KYC_MIN_LIVENESS_FRAMES (default 5).
+  const SELFIE_FRAME_COUNT = 8;
 
   let documentType = $state('KTP');
-
-  let claimedIdentity = $state({
-    nik: '',
-    full_name: '',
-    date_of_birth: '',
-    sim_number: '',
-    sim_class: '',
-  });
 
   let claimedVehicle = $state({
     plate_number: '',
@@ -41,7 +40,7 @@
   let locatingBusy = $state(false);
 
   let idPhotoBlob = $state(null);
-  let selfiePhotoBlob = $state(null);
+  let selfieFrameBlobs = $state([]);
   let stnkPhotoBlob = $state(null);
   let photosResetKey = $state(0);
 
@@ -51,13 +50,9 @@
 
   const canSubmit = $derived(
     !!idPhotoBlob &&
-      !!selfiePhotoBlob &&
+      selfieFrameBlobs.length >= SELFIE_FRAME_COUNT &&
       (!includeStnkPhoto || !!stnkPhotoBlob) &&
       !!location &&
-      claimedIdentity.nik.length === 16 &&
-      claimedIdentity.full_name.trim().length > 0 &&
-      !!claimedIdentity.date_of_birth &&
-      (documentType !== 'SIM' || claimedIdentity.sim_number.trim().length > 0) &&
       claimedVehicle.plate_number.trim().length > 0 &&
       (includeStnkPhoto ||
         (claimedVehicle.brand.trim().length > 0 &&
@@ -78,10 +73,6 @@
   }
 
   function buildPayload() {
-    const identity = { ...claimedIdentity };
-    if (!identity.sim_number) delete identity.sim_number;
-    if (!identity.sim_class) delete identity.sim_class;
-
     const vehicle = {
       plate_number: claimedVehicle.plate_number,
       vehicle_type: claimedVehicle.vehicle_type,
@@ -92,7 +83,6 @@
 
     const payload = {
       document_type: documentType,
-      claimed_identity: identity,
       claimed_vehicle: vehicle,
       device: { device_id: deviceId, location },
     };
@@ -119,18 +109,19 @@
       const payload = buildPayload();
       result = await submitKycVerification(payload, {
         idDocumentPhoto: idPhotoBlob,
-        selfiePhoto: selfiePhotoBlob,
+        selfieFrames: selfieFrameBlobs,
         stnkPhoto: includeStnkPhoto ? stnkPhotoBlob : null,
       });
     } catch (err) {
       submitError = err;
     } finally {
       submitting = false;
-      // This harness processes a photo exactly once: drop every reference
-      // right after the request settles, and remount the camera components
-      // (photosResetKey) so a retry always starts from a fresh capture.
+      // This harness processes each photo/frame exactly once: drop every
+      // reference right after the request settles, and remount the camera
+      // components (photosResetKey) so a retry always starts from a fresh
+      // capture.
       idPhotoBlob = null;
-      selfiePhotoBlob = null;
+      selfieFrameBlobs = [];
       stnkPhotoBlob = null;
       photosResetKey += 1;
     }
@@ -140,9 +131,11 @@
 <main>
   <h1>Rihlah — Driver KYC test harness</h1>
   <p class="lede">
-    Captures a live document photo and selfie straight into browser memory, sends them once to
-    <code>POST /kyc/verify</code>, and discards them. No photo is ever written to disk or
-    localStorage — only <code>device_id</code> (an opaque fingerprint) persists locally.
+    Captures a live document photo and a burst of selfie frames straight into browser memory,
+    sends them once to <code>POST /kyc/verify</code>, and discards them. Identity (NIK/name/date
+    of birth) is read entirely off the document by OCR and confirmed via a Dukcapil stub — nothing
+    here is typed manually. No photo/frame is ever written to disk or localStorage — only
+    <code>device_id</code> (an opaque fingerprint) persists locally.
   </p>
 
   <form onsubmit={handleSubmit}>
@@ -156,35 +149,10 @@
     </section>
 
     <section class="panel">
-      <h2>Claimed identity</h2>
-      <p class="hint">What the driver says is true — cross-checked against what OCR reads off the photo.</p>
-      <div class="grid">
-        <div>
-          <label for="nik">NIK (16 digits)</label>
-          <input id="nik" bind:value={claimedIdentity.nik} maxlength="16" pattern="\d{16}" placeholder="3173015505990001" />
-        </div>
-        <div>
-          <label for="full_name">Full name</label>
-          <input id="full_name" bind:value={claimedIdentity.full_name} placeholder="Budi Santoso" />
-        </div>
-        <div>
-          <label for="dob">Date of birth</label>
-          <input id="dob" type="date" bind:value={claimedIdentity.date_of_birth} />
-        </div>
-        <div>
-          <label for="sim_number">SIM number {documentType === 'SIM' ? '(required)' : '(optional)'}</label>
-          <input id="sim_number" bind:value={claimedIdentity.sim_number} placeholder="990412345678" />
-        </div>
-        <div>
-          <label for="sim_class">SIM class</label>
-          <select id="sim_class" bind:value={claimedIdentity.sim_class}>
-            <option value="">—</option>
-            {#each SIM_CLASSES as cls (cls)}
-              <option value={cls}>{cls}</option>
-            {/each}
-          </select>
-        </div>
-      </div>
+      <p class="hint">
+        No identity fields here anymore — NIK, name, and date of birth are read entirely off the
+        <code>{documentType}</code> photo below by OCR, then confirmed against Dukcapil server-side.
+      </p>
     </section>
 
     <section class="panel">
@@ -272,7 +240,12 @@
         <h2>Live photos</h2>
         <div class="camera-grid">
           <CameraCapture label="KTP/SIM photo" onCapture={(blob) => (idPhotoBlob = blob)} onClear={() => (idPhotoBlob = null)} />
-          <CameraCapture label="Selfie" onCapture={(blob) => (selfiePhotoBlob = blob)} onClear={() => (selfiePhotoBlob = null)} />
+          <BurstCapture
+            label="Selfie burst (liveness)"
+            frameCount={SELFIE_FRAME_COUNT}
+            onCapture={(frames) => (selfieFrameBlobs = frames)}
+            onClear={() => (selfieFrameBlobs = [])}
+          />
           {#if includeStnkPhoto}
             <CameraCapture label="STNK photo" onCapture={(blob) => (stnkPhotoBlob = blob)} onClear={() => (stnkPhotoBlob = null)} />
           {/if}

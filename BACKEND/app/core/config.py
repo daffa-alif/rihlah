@@ -14,7 +14,7 @@ class Settings(BaseSettings):
 
     project_name: str = "Rihlah API"
     description: str = "Backend API for the Rihlah trip planning platform."
-    version: str = "0.1.0"
+    version: str = "0.2.0"
     api_v1_prefix: str = "/api/v1"
 
     environment: str = "development"
@@ -45,6 +45,25 @@ class Settings(BaseSettings):
     kyc_service_area_north: float = 6.0
     kyc_service_area_west: float = 95.0
     kyc_service_area_east: float = 141.0
+
+    # --- Liveness (frame-by-frame, see app/services/kyc/vision.py) --------
+    # The client (Flutter app) captures a short live burst/video of the
+    # selfie and uploads it as an ordered set of frames; the backend never
+    # decodes a video container itself, it just analyzes whatever frames it
+    # receives. min/max bound how many frames one request may submit.
+    kyc_min_liveness_frames: int = 5
+    kyc_max_liveness_frames: int = 40
+    # Require an actual open->closed->open blink transition across the
+    # frames, not just a high blended score, before liveness can pass.
+    kyc_require_blink: bool = True
+
+    # --- Dukcapil identity confirmation (app/services/kyc/dukcapil.py) -----
+    # No real Dukcapil (Indonesian civil registry) credential exists for this
+    # project yet, so this always talks to the in-process stub regardless of
+    # these being set. They exist so swapping in the real integration later
+    # is a config change, not a code change.
+    kyc_dukcapil_base_url: str | None = None
+    kyc_dukcapil_api_key: str | None = None
 
     @property
     def kyc_max_upload_bytes(self) -> int:
