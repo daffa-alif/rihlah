@@ -1,0 +1,62 @@
+# RIHLAH API — Cloud Run service configuration
+# Deploy with:
+#   gcloud run deploy rihlah-api --source backend/ --region asia-southeast2
+#
+# This file documents the expected configuration; actual deployment
+# uses gcloud CLI or the GitHub Actions workflow.
+
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: rihlah-api
+  namespace: rihlah-prod
+spec:
+  template:
+    metadata:
+      annotations:
+        autoscaling.knative.dev/minScale: "1"
+        autoscaling.knative.dev/maxScale: "20"
+        run.googleapis.com/cpu-throttling: "false"
+    spec:
+      containerConcurrency: 80
+      timeoutSeconds: 300
+      serviceAccountName: rihlah-api@rihlah-75a1b.iam.gserviceaccount.com
+      containers:
+        - image: gcr.io/rihlah-75a1b/rihlah-api
+          ports:
+            - containerPort: 8080
+          env:
+            - name: NODE_ENV
+              value: production
+          envFrom:
+            - secretRef:
+                name: rihlah-api-secrets
+          resources:
+            limits:
+              cpu: "2"
+              memory: "1Gi"
+---
+# Matching Worker — separate service so cascade timeouts are never
+# blocked by request-handling load.
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: rihlah-matching-worker
+  namespace: rihlah-prod
+spec:
+  template:
+    spec:
+      containerConcurrency: 1
+      timeoutSeconds: 900
+      serviceAccountName: rihlah-api@rihlah-75a1b.iam.gserviceaccount.com
+      containers:
+        - image: gcr.io/rihlah-75a1b/rihlah-matching-worker
+          ports:
+            - containerPort: 8081
+          envFrom:
+            - secretRef:
+                name: rihlah-api-secrets
+          resources:
+            limits:
+              cpu: "1"
+              memory: "512Mi"

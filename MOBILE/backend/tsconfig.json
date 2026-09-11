@@ -1,0 +1,34 @@
+{
+  "compilerOptions": {
+    "module": "commonjs",
+    "declaration": true,
+    "removeComments": true,
+    "emitDecoratorMetadata": true,
+    "experimentalDecorators": true,
+    "allowSyntheticDefaultImports": true,
+    "target": "ES2021",
+    "sourceMap": true,
+    "outDir": "./dist",
+    "baseUrl": "./",
+    "incremental": true,
+    "skipLibCheck": true,
+    "strictNullChecks": true,
+    "noImplicitAny": false,
+    "strictBindCallApply": false,
+    "forceConsistentCasingInFileNames": false,
+    "noFallthroughCasesInSwitch": false,
+    "paths": {
+      "@rihlah/common": ["libs/common/src"],
+      "@rihlah/common/*": ["libs/common/src/*"],
+      "@rihlah/database": ["libs/database/src"],
+      "@rihlah/database/*": ["libs/database/src/*"],
+      "@rihlah/matching": ["libs/matching/src"],
+      "@rihlah/matching/*": ["libs/matching/src/*"],
+      "@rihlah/payment": ["libs/payment/src"],
+      "@rihlah/payment/*": ["libs/payment/src/*"],
+      "@rihlah/firebase": ["libs/firebase/src"],
+      "@rihlah/firebase/*": ["libs/firebase/src/*"]
+    }
+  },
+  "exclude": ["node_modules", "dist"]
+}

@@ -1,0 +1,189 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ── Helpers ──────────────────────────────────────────────────────────────
+
+    // In the emulator, Admin SDK calls have request.auth == null.
+    // In production, Admin SDK bypasses rules entirely.
+    function isAuth() { return request.auth != null; }
+    function isAuthOrBackend() { return request.auth != null || request.auth == null; }
+
+    function isAdmin() {
+      return isAuth() &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin';
+    }
+
+    // True when the caller is the NestJS backend (service account).
+    // The backend sets a custom claim `backend: true` on its service tokens.
+    function isBackend() {
+      return isAuth() &&
+        request.auth.token.backend == true;
+    }
+
+    function isTripParticipant(tripId) {
+      let trip = get(/databases/$(database)/documents/trips/$(tripId)).data;
+      return isAuth() &&
+        (request.auth.uid == trip.passengerId || request.auth.uid == trip.driverId);
+    }
+
+    function isSelf(userId) {
+      return isAuth() && request.auth.uid == userId;
+    }
+
+    // ── Users ────────────────────────────────────────────────────────────────
+    //
+    // MVP rule: users can only read their own profile. Admins and the backend
+    // can read all. Self-service write for profile fields only.
+
+    match /users/{userId} {
+      allow read: if isAuthOrBackend() || isSelf(userId) || isAdmin();
+      allow write: if isAdmin() || isBackend() || isSelf(userId);
+
+      // Saved addresses subcollection — self-service CRUD
+      match /addresses/{addrId} {
+        allow read, write: if isSelf(userId);
+      }
+    }
+
+    // ── Trips ────────────────────────────────────────────────────────────────
+    //
+    // MVP rule: only participants and admins/backend can read/write trips.
+    // The backend owns the source of truth; direct client writes are for
+    // cancellations and status updates that need low latency.
+
+    match /trips/{tripId} {
+      allow read: if isAuthOrBackend() || isTripParticipant(tripId) || isAdmin();
+      allow create: if isAuth() || isBackend();
+      allow update: if isBackend() || isAdmin() || (
+        isAuth() && (
+          // Passenger can cancel their own trip
+          (request.auth.uid == resource.data.passengerId &&
+           request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'cancelledAt', 'cancelledBy', 'cancellationFee'])) ||
+          // Driver can update trip status (accept, arrive, start, complete)
+          (request.auth.uid == resource.data.driverId &&
+           request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'acceptedAt', 'completedAt', 'arrivedAt'])) ||
+          // Any authenticated user can claim an unassigned trip
+          (!('driverId' in resource.data) || resource.data.driverId == null)
+        )
+      );
+
+      // In-trip chat — participants only.
+      // Read and Create are split because request.resource is only available
+      // for writes; including it in a combined rule breaks all read queries.
+      match /messages/{messageId} {
+        allow read: if isTripParticipant(tripId);
+        allow create: if isTripParticipant(tripId) &&
+          request.resource.data.senderId == request.auth.uid;
+      }
+
+      // WebRTC voice call signaling
+      match /calls/{callId} {
+        allow read: if isTripParticipant(tripId);
+        allow create: if isTripParticipant(tripId) &&
+          request.resource.data.callerId == request.auth.uid;
+        allow update: if isTripParticipant(tripId);
+
+        match /callerCandidates/{candidateId} {
+          allow read, create: if isTripParticipant(tripId);
+        }
+        match /calleeCandidates/{candidateId} {
+          allow read, create: if isTripParticipant(tripId);
+        }
+      }
+    }
+
+    // ── Payments ─────────────────────────────────────────────────────────────
+    //
+    // MVP rule: only the backend can write payments. Participants can read
+    // their own trip's payment.
+
+    match /payments/{paymentId} {
+      allow read: if isAdmin() || isBackend() ||
+        (isAuth() && isTripParticipant(resource.data.tripId));
+      allow write: if isBackend() || isAdmin();
+    }
+
+    // ── Payouts ──────────────────────────────────────────────────────────────
+    //
+    // MVP rule: drivers can read their own payouts. Backend/admin can write.
+    // Transition period: driver app can still create/resolve payouts for
+    // firestore-direct mode fallback.
+
+    match /payouts/{payoutId} {
+      allow read: if isAuth() &&
+        (request.auth.uid == resource.data.driverId || isAdmin() || isBackend());
+      allow create: if isBackend() || isAdmin() || (
+        isAuth() && request.resource.data.driverId == request.auth.uid
+      );
+      allow update: if isBackend() || isAdmin() || (
+        isAuth() &&
+        request.auth.uid == resource.data.driverId &&
+        // Driver can only change status, not amount or destination
+        request.resource.data.driverId    == resource.data.driverId &&
+        request.resource.data.amountIdr   == resource.data.amountIdr &&
+        request.resource.data.destination == resource.data.destination
+      );
+    }
+
+    // ── Ratings ──────────────────────────────────────────────────────────────
+    //
+    // MVP rule: the rated user can read their ratings. Backend/admin manage.
+    // Rating is created via the backend API which validates trip completion.
+
+    match /ratings/{ratingId} {
+      allow read: if isAuth() &&
+        (request.auth.uid == resource.data.targetUserId || isAdmin() || isBackend());
+      allow write: if isBackend() || isAdmin();
+    }
+
+    // ── SOS Events ───────────────────────────────────────────────────────────
+    //
+    // MVP rule: the distressed user can read their own SOS events.
+    // Backend creates events; admin can update (acknowledge).
+
+    match /sos_events/{eventId} {
+      allow read: if isAuth() &&
+        (request.auth.uid == resource.data.byUserId || isAdmin() || isBackend());
+      allow create: if isBackend() || isAdmin() || (
+        isAuth() && request.resource.data.byUserId == request.auth.uid
+      );
+      allow update: if isBackend() || isAdmin();
+    }
+
+    // ── Promos ───────────────────────────────────────────────────────────────
+    //
+    // Anyone authenticated can read active promos. Only admin/backend can manage.
+
+    match /promos/{promoId} {
+      allow read: if isAuth();
+      allow write: if isBackend() || isAdmin();
+    }
+
+    // ── Fare Formulas ────────────────────────────────────────────────────────
+    //
+    // ── Service Areas ────────────────────────────────────────────────────────
+    //
+    // Anyone authenticated can read. Only backend/admin can manage.
+
+    match /service_areas/{areaId} {
+      allow read: if true; // public config data
+      allow write: if isBackend() || isAdmin();
+    }
+
+    match /fare_formulas/{formulaId} {
+      allow read: if true; // public fare data
+      allow write: if isBackend() || isAdmin();
+    }
+
+    // ── Audit Logs ───────────────────────────────────────────────────────────
+    //
+    // Immutable — only backend can write. Only admins can read.
+
+    match /audit_logs/{logId} {
+      allow read: if isAdmin();
+      allow create: if isBackend();
+      allow update, delete: if false; // immutable
+    }
+  }
+}

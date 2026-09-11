@@ -1,0 +1,291 @@
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["postgresqlExtensions"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+  extensions = [postgis(version: "3.4")]
+}
+
+// ── Users ────────────────────────────────────────────────────────────────────────
+
+model User {
+  id             String    @id @default(uuid())
+  firebaseUid    String    @unique
+  phoneEnc       String    // AES-256-GCM encrypted
+  nameEnc        String    // AES-256-GCM encrypted
+  role           String    @default("passenger") // passenger | driver | admin
+  photoUrl       String?
+  accountStatus  String    @default("active") // active | suspended
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  driver         Driver?
+  passenger      Passenger?
+  ratingsGiven   Rating[]   @relation("RatingBy")
+  ratingsReceived Rating[]  @relation("RatingTarget")
+  sosEvents      SosEvent[]
+  auditLogs      AuditLog[]
+
+  @@index([firebaseUid])
+  @@index([role])
+  @@index([accountStatus])
+  @@map("users")
+}
+
+// ── Passengers ────────────────────────────────────────────────────────────────────
+
+model Passenger {
+  id                String   @id @default(uuid())
+  userId            String   @unique
+  defaultPayment    String   @default("cash")
+  emergencyContacts Json?    // [{ name, phone }] up to 3
+
+  user              User     @relation(fields: [userId], references: [id])
+
+  @@map("passengers")
+}
+
+// ── Drivers ──────────────────────────────────────────────────────────────────────
+
+model Driver {
+  id               String   @id @default(uuid())
+  userId           String   @unique
+  ktpNumberEnc     String?  // AES-256-GCM encrypted
+  vehicleType      String?  // car | bike
+  plate            String?
+  photoUrl         String?
+  ratingAvg        Float    @default(0)
+  ratingCount      Int      @default(0)
+  totalTrips       Int      @default(0)
+  acceptanceRate   Float    @default(0)
+  online           Boolean  @default(false)
+  lastLat          Float?
+  lastLng          Float?
+  location         Unsupported("geometry(Point, 4326)")?
+  onlineAt         DateTime?
+  bpjsKt           String   @default("not_registered") // active | expired | not_registered
+  bpjsKs           String   @default("not_registered")
+  bpjsInsurance    String   @default("not_registered")
+  balanceIdr       Int      @default(0)
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  user             User     @relation(fields: [userId], references: [id])
+
+  @@index([online])
+  @@index([vehicleType])
+  @@map("drivers")
+}
+
+// ── Trips ─────────────────────────────────────────────────────────────────────────
+
+model Trip {
+  id                  String    @id @default(uuid())
+  passengerId         String
+  driverId            String?
+  serviceType         String    // car | bike | send
+  pickupLat           Float
+  pickupLng           Float
+  pickupAddress       String
+  dropoffLat          Float
+  dropoffLng          Float
+  dropoffAddress      String
+  distanceM           Int       // meters
+  durationS           Int       // seconds
+  fareIdr             Int
+  driverShareIdr      Int       @default(0)
+  platformFeeIdr      Int       @default(0)
+  paymentMethod       String    @default("cash")
+  status              String    @default("searching") // searching|accepted|arriving|arrived|inTrip|completed|cancelled
+  fareFormulaVersion  Int       @default(1)
+  passengerName       String?
+  passengerPhoneEnc   String?
+  appliedVoucherCode  String?
+  appliedDiscountIdr  Int       @default(0)
+  passengerRating     Int?      // 1-5
+  passengerTip        Int?      // tip in IDR
+  passengerReview     String?
+  skippedByIds        String[]  @default([]) // driver IDs who declined
+  createdAt           DateTime  @default(now())
+  acceptedAt          DateTime?
+  completedAt         DateTime?
+  cancelledAt         DateTime?
+
+  passenger           User      @relation(fields: [passengerId], references: [id])
+  driver              User?     @relation(fields: [driverId], references: [id])
+  payment             Payment?
+  ratings             Rating[]
+
+  @@index([status])
+  @@index([passengerId])
+  @@index([driverId])
+  @@index([createdAt])
+  @@map("trips")
+}
+
+// ── Payments ──────────────────────────────────────────────────────────────────────
+
+model Payment {
+  id              String    @id @default(uuid())
+  tripId          String    @unique
+  method          String    // cash | qris | gopay | ovo | dana | shopeepay
+  amountIdr       Int
+  status          String    @default("PENDING") // PENDING|SETTLED|COMPLETED|FAILED|CASH_CONFIRMED
+  gatewayRef      String?
+  idempotencyKey  String    @unique
+  webhookRaw      Json?
+  settledAt       DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  trip            Trip      @relation(fields: [tripId], references: [id])
+
+  @@index([tripId])
+  @@index([status])
+  @@map("payments")
+}
+
+// ── Payouts ───────────────────────────────────────────────────────────────────────
+
+model Payout {
+  id              String    @id @default(uuid())
+  driverId        String
+  amountIdr       Int
+  feeIdr          Int       @default(0)
+  destination     String    // masked bank account or e-wallet
+  status          String    @default("PROCESSING") // PROCESSING|SUCCESS|FAILED
+  gatewayRef      String?
+  idempotencyKey  String    @unique
+  requestedAt     DateTime  @default(now())
+  paidAt          DateTime?
+  failedAt        DateTime?
+  failureReason   String?
+
+  driver          User      @relation(fields: [driverId], references: [id])
+
+  @@index([driverId])
+  @@index([status])
+  @@map("payouts")
+}
+
+// ── Ratings ───────────────────────────────────────────────────────────────────────
+
+model Rating {
+  id            String    @id @default(uuid())
+  tripId        String
+  byUserId      String
+  targetUserId  String
+  stars         Int       // 1-5
+  tags          String[]  // Sopan, Tepat waktu, Jalan aman, Kendaraan bersih, etc.
+  comment       String?   // max 280 chars
+  createdAt     DateTime  @default(now())
+
+  trip          Trip      @relation(fields: [tripId], references: [id])
+  byUser        User      @relation("RatingBy", fields: [byUserId], references: [id])
+  targetUser    User      @relation("RatingTarget", fields: [targetUserId], references: [id])
+
+  @@index([tripId])
+  @@index([targetUserId])
+  @@map("ratings")
+}
+
+// ── SOS Events ────────────────────────────────────────────────────────────────────
+
+model SosEvent {
+  id                String    @id @default(uuid())
+  tripId            String?
+  byUserId          String
+  byUserRole        String?   // passenger | driver
+  byUserName        String?
+  lat               Float
+  lng               Float
+  audioUrl          String?
+  contactsNotified  String[]  @default([])
+  status            String    @default("open") // open | acknowledged
+  createdAt         DateTime  @default(now())
+
+  byUser            User      @relation(fields: [byUserId], references: [id])
+
+  @@index([status])
+  @@index([createdAt])
+  @@map("sos_events")
+}
+
+// ── Fare Formulas ─────────────────────────────────────────────────────────────────
+
+model FareFormula {
+  id          String    @id @default(uuid())
+  version     Int       @unique
+  baseCar     Int       // Rp 5000
+  perKmCar    Int       // Rp 3000
+  perMinCar   Int       // Rp 300
+  baseBike    Int       // Rp 3000
+  perKmBike   Int       // Rp 2000
+  perMinBike  Int       // Rp 200
+  baseSend    Int       // Rp 4000
+  perKmSend   Int       // Rp 2500
+  perMinSend  Int       // Rp 250
+  platformFeeRate Float  @default(0.05)
+  maxKmCar    Float     @default(50)
+  maxKmBike   Float     @default(25)
+  maxKmSend   Float     @default(30)
+  validFrom   DateTime
+  validTo     DateTime?
+  createdAt   DateTime  @default(now())
+
+  @@index([version])
+  @@map("fare_formulas")
+}
+
+// ── Service Areas ─────────────────────────────────────────────────────────────────
+
+model ServiceArea {
+  id       String   @id @default(uuid())
+  name     String   // Bandung Kota, Cimahi
+  geojson  Json     // GeoJSON polygon
+  active   Boolean  @default(true)
+
+  @@map("service_areas")
+}
+
+// ── Audit Log ─────────────────────────────────────────────────────────────────────
+
+model AuditLog {
+  id          String    @id @default(uuid())
+  actorId     String
+  action      String    // create, update, delete, read
+  resource    String    // users, trips, payments, payouts, ratings
+  resourceId  String?
+  oldValue    Json?
+  newValue    Json?
+  ipAddress   String?
+  createdAt   DateTime  @default(now())
+
+  actor       User      @relation(fields: [actorId], references: [id])
+
+  @@index([actorId])
+  @@index([resource])
+  @@index([createdAt])
+  @@map("audit_logs")
+}
+
+// ── Promos ────────────────────────────────────────────────────────────────────────
+
+model Promo {
+  id            String    @id @default(uuid())
+  code          String    @unique
+  title         String
+  description   String
+  discountType  String    // percent | flat
+  discountValue Int       // percentage points or IDR amount
+  minOrderIdr   Int       @default(0)
+  expiryLabel   String
+  isActive      Boolean   @default(true)
+  createdAt     DateTime  @default(now())
+
+  @@index([code])
+  @@map("promos")
+}
